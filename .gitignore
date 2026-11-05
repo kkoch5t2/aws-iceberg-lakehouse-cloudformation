@@ -1,0 +1,13 @@
+# Ignore local credentials and generated files
+.aws/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+**/credentials
+**/config.local
+.DS_Store
+Thumbs.db
