@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Small, cost-conscious lakehouse-lab using Apache Iceberg on
+  standard Amazon S3, AWS Glue Data Catalog and Amazon Athena engine v3.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Lab settings
+        Parameters:
+          - DatabaseName
+          - QueryScanLimitBytes
+    ParameterLabels:
+      DatabaseName:
+        default: Glue database name
+      QueryScanLimitBytes:
+        default: Athena scan cutoff (bytes per query)
+
+Parameters:
+  DatabaseName:
+    Type: String
+    Default: lakehouse_lab
+    AllowedPattern: '^[a-z][a-z0-9_]{2,62}$'
+    Description: >-
+      Lowercase Glue database name, unique in this account and Region.
+      A different value is needed if the database already exists.
+  QueryScanLimitBytes:
+    Type: Number
+    Default: 1073741824
+    MinValue: 10485760
+    Description: >-
+      Athena per-query scanned-byte cutoff. Default is 1 GiB.
+      This is NOT a spending cap.
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'lakehouse-lab-data-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: lakehouse-lab
+
+  DataBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  QueryResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'lakehouse-lab-athena-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAthenaResultsAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: lakehouse-lab
+
+  QueryResultsBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref QueryResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt QueryResultsBucket.Arn
+              - !Sub '${QueryResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: >-
+          Glue Data Catalog database for Apache Iceberg tables on ordinary S3.
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: lakehouse-lab-wg
+      Description: Athena engine v3 workgroup dedicated to lakehouse-lab.
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: !Ref QueryScanLimitBytes
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${QueryResultsBucket}/athena-results/'
+          ExpectedBucketOwner: !Ref AWS::AccountId
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+      Tags:
+        - Key: Project
+          Value: lakehouse-lab
+
+  CreateOrdersQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-01-create-iceberg-table'
+      Description: '01: Create an Apache Iceberg v2 table and register it in Glue.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        CREATE TABLE ${GlueDatabase}.orders (
+          order_id bigint,
+          customer_name string,
+          amount decimal(10,2),
+          status string,
+          order_date date
+        )
+        PARTITIONED BY (month(order_date))
+        LOCATION 's3://${DataBucket}/warehouse/orders/'
+        TBLPROPERTIES (
+          'table_type'='ICEBERG',
+          'format'='parquet',
+          'write_compression'='snappy'
+        )
+
+  InsertOrdersQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-02-insert-sample-rows'
+      Description: '02: Run ONCE. Inserts a few rows and creates a snapshot.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        INSERT INTO ${GlueDatabase}.orders
+          (order_id, customer_name, amount, status, order_date)
+        VALUES
+          (1, 'Alice', DECIMAL '1200.00', 'new', DATE '2026-11-01'),
+          (2, 'Bob', DECIMAL '2500.00', 'new', DATE '2026-11-02'),
+          (3, 'Carol', DECIMAL '800.00', 'new', DATE '2026-11-03')
+
+  SelectOrdersQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-03-select-rows'
+      Description: '03: Query the Iceberg table.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT *
+        FROM ${GlueDatabase}.orders
+        ORDER BY order_id
+
+  UpdateOrderQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-04-update-row'
+      Description: '04: Update a row to create another Iceberg snapshot.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        UPDATE ${GlueDatabase}.orders
+        SET amount = DECIMAL '1350.00', status = 'paid'
+        WHERE order_id = 1
+
+  DeleteOrderQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-05-delete-row'
+      Description: '05: Delete a row to create another Iceberg snapshot.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        DELETE FROM ${GlueDatabase}.orders
+        WHERE order_id = 3
+
+  ShowSnapshotsQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-06-show-snapshots'
+      Description: '06: Inspect Iceberg snapshot IDs and commit timestamps.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT *
+        FROM "${GlueDatabase}"."orders$snapshots"
+        ORDER BY committed_at DESC
+
+  ShowFilesQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-07-show-files'
+      Description: '07: Inspect the current Iceberg data files.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT *
+        FROM "${GlueDatabase}"."orders$files"
+
+  OptimizeOrdersQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-08-optimize-iceberg'
+      Description: '08: Optional; compaction may incur query and S3 costs.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        OPTIMIZE ${GlueDatabase}.orders REWRITE DATA USING BIN_PACK
+
+  VacuumOrdersQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 'lakehouse-lab-09-vacuum-iceberg'
+      Description: '09: Optional; expires old snapshots. Run only after time-travel tests.'
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        VACUUM ${GlueDatabase}.orders
+
+Outputs:
+  Region:
+    Description: AWS Region where this stack is deployed.
+    Value: !Ref AWS::Region
+  GlueDatabaseName:
+    Description: Glue Data Catalog database for the Iceberg table.
+    Value: !Ref GlueDatabase
+  IcebergTableName:
+    Description: Table to create using saved Athena query 01.
+    Value: !Sub '${GlueDatabase}.orders'
+  DataBucketName:
+    Description: Ordinary S3 bucket where Iceberg files will be stored.
+    Value: !Ref DataBucket
+  IcebergTableLocation:
+    Description: S3 location for Iceberg table data and metadata.
+    Value: !Sub 's3://${DataBucket}/warehouse/orders/'
+  QueryResultsBucketName:
+    Description: S3 bucket for Athena query results (7-day lifecycle).
+    Value: !Ref QueryResultsBucket
+  AthenaWorkGroupName:
+    Description: Select this workgroup in Athena before running saved queries.
+    Value: !Ref AthenaWorkGroup
